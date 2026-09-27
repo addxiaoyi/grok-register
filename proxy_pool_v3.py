@@ -20,6 +20,7 @@ from curl_cffi import requests
 from proxy_protocol_runtime import ProtocolRuntimeManager
 from proxy_protocols import ProxyDescriptor, ProxyProtocolError, parse_proxy_line, parse_subscription_source
 from error_taxonomy import classify_proxy_network_error, is_transport_error_text
+from proxy_pool_registry import reconcile_nodes
 from proxy_pool_policies import (
     DefaultSelectorPolicy,
     DefaultFailurePolicy,
@@ -443,26 +444,18 @@ class ProxyPoolManager:
                 return self.snapshot()
         entries = self._source_entries()
         with self._condition:
-            previous, updated = self._nodes, {}
-            for source, descriptor in entries:
-                node_id = descriptor.node_id
-                old = previous.get(node_id)
-                if old is not None:
-                    old.source, old.proxy_url, old.descriptor = source, descriptor.canonical_uri, descriptor
-                    old.protocol, old.name, old.backend = descriptor.protocol, descriptor.name, descriptor.backend
-                    old.rotating, old.retired = self._rotating_for(descriptor), False
-                    updated[node_id] = old
-                else:
-                    node = ProxyNode(
-                        id=node_id, source=source, proxy_url=descriptor.canonical_uri, descriptor=descriptor,
-                        protocol=descriptor.protocol, name=descriptor.name, backend=descriptor.backend,
-                        rotating=self._rotating_for(descriptor),
-                    )
-                    self._restore_node_state(node)
-                    updated[node_id] = node
-            for node_id, old in previous.items():
-                if node_id not in updated and old.inflight > 0:
-                    old.retired = True; updated[node_id] = old
+            previous = self._nodes
+            updated = reconcile_nodes(
+                previous,
+                entries,
+                lambda src, desc: ProxyNode(
+                    id=desc.node_id, source=src, proxy_url=desc.canonical_uri, descriptor=desc,
+                    protocol=desc.protocol, name=desc.name, backend=desc.backend,
+                    rotating=self._rotating_for(desc),
+                ),
+                self._rotating_for,
+                self._restore_node_state,
+            )
             self._nodes = updated
             self._last_refresh = now
             self._condition.notify_all()
