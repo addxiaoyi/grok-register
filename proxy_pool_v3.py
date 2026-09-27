@@ -220,7 +220,7 @@ def classify_proxy_network_error(value):
 
 
 def _is_transport_error_text(value):
-    return classify_proxy_network_error(value) in ("hard_transport", "suspected_transport")
+    return is_transport_error_text(value)
 
 
 def is_proxy_transport_exception(exc):
