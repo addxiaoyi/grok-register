@@ -20,6 +20,12 @@ from curl_cffi import requests
 from proxy_protocol_runtime import ProtocolRuntimeManager
 from proxy_protocols import ProxyDescriptor, ProxyProtocolError, parse_proxy_line, parse_subscription_source
 from error_taxonomy import classify_proxy_network_error, is_transport_error_text
+from proxy_pool_policies import (
+    DefaultSelectorPolicy,
+    DefaultFailurePolicy,
+    SelectorPolicy,
+    FailurePolicy,
+)
 
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 _MAX_SOURCE_BYTES = 2 << 20
