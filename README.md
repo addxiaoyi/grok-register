@@ -41,6 +41,7 @@ Grok Register 是一个面向自动化流程研究、测试环境验证和个人
 - [运行方式](#运行方式)
 - [配置说明](#配置说明)
 - [代理与代理池](#代理与代理池)
+- [代理池模块架构](#代理池模块架构)
 - [可选多线程注册](#可选多线程注册)
 - [grok2api token 入池](#grok2api-token-入池)
 - [CPA / xAI OIDC 导出](#cpa--xai-oidc-导出)
@@ -443,6 +444,57 @@ ss://...
 
 完整参数、协议映射、运行时和健康度规则见 [`docs/proxy-pool.md`](docs/proxy-pool.md)。
 
+### 代理池模块架构
+
+代理池核心经过模块化拆分，按职责分为五层。业务层只与最上层的 Facade 交互，不需要了解调度、健康度或节点合并细节。
+
+```text
+registration_flow.py / registration_browser.py / mail_service.py
+                        │  业务层调用方
+                        │  begin/end_registration_slot()
+                        ▼
+┌──────────────────────────────────────────────────────────┐
+│ pool_api.py — ProxyPool (Facade)                        │
+│   acquire() / release() / reload() / probe() / status()  │
+│   封装线程本地租约，对外屏蔽 Manager 与内部模块            │
+└──────────────────────────────────────────────────────────┘
+                        ▼
+┌──────────────────────────────────────────────────────────┐
+│ proxy_pool_v3.py — ProxyPoolManager (核心调度器)          │
+│   _source_registry → _probe_scheduler → _runtime         │
+│   _selector        → Tier 决策 / Affinity / Health 选择   │
+└──────────────────────────────────────────────────────────┘
+                        ▼
+┌──────────────────────────────────────────────────────────┐
+│ proxy_pool_policies.py   SelectorPolicy / FailurePolicy  │
+│ proxy_pool_registry.py   SourceRegistry / reconcile_nodes │
+│ proxy_pool_probe.py      ProbeScheduler                  │
+│ error_taxonomy.py        错误分类与文本化                  │
+└──────────────────────────────────────────────────────────┘
+```
+
+调用链：
+
+```text
+begin_registration_slot(...)
+  → get_pool().acquire(...)
+      → manager.acquire(affinity, worker_key)
+          → _selector.select(...)
+              → _runtime.get_or_start(proxy) → ProxyLease
+end_registration_slot(success, transport_error)
+  → get_pool().release(...)
+      → manager.release(lease) → 归还 runtime
+```
+
+要点：
+
+- **Facade 单例**：`get_pool()` 返回全局唯一 `ProxyPool` 实例，租约存放在 `threading.local`，保证同一账号 attempt 内的浏览器、邮箱、NSFW、CPA 共用同一出口。
+- **源状态机**：`SourceRegistry` 为文件源和订阅源各维护 `SourceState`。单个源刷新失败时保留上一次成功的节点并标记 `stale`，订阅故障只会降级为「陈旧但可用」，不会清空代理池。
+- **纯函数节点合并**：`reconcile_nodes()` 不加锁、不做 I/O，仅依赖注入的回调完成 diff 与合并，可脱离池状态单测。节点从源中消失时，若仍有在途租约则保留并标记 `retired`，避免在途请求拿到已不存在的节点。
+- **探测调度**：`ProbeScheduler` 负责失败节点的即时探测与周期性探测，健康度分 `HEALTHY / STALE / UNHEALTHY` 三档。
+- **向后兼容**：`proxy_pool.py` 保留 `from proxy_pool_v3 import *`，旧有 `import proxy_pool as P; P.get_manager()` 写法继续可用。
+- **破环方式**：Facade 与 Manager 存在天然双向依赖，通过 `_tls()` 辅助函数的延迟导入化解，避免循环引用。
+
 ## 可选多线程注册
 
 默认关闭：
@@ -562,7 +614,12 @@ python grok_register_ttk.py retry-pending <pending文件> [输出文件]
 ├── registration_browser.py    # Chromium 注册页面状态与提交逻辑
 ├── browser_runtime.py         # 共享 HTTP、Chromium Options 与代理注入
 ├── proxy_pool.py              # proxy_pool_v3 的兼容导出层
-├── proxy_pool_v3.py           # 代理池核心：Source、Lease、健康度、冷却、刷新与 Probe
+├── pool_api.py                # 代理池公共 Facade：ProxyPool 单例与线程本地租约
+├── proxy_pool_v3.py           # 代理池核心调度器：Lease、健康度、冷却与选择
+├── proxy_pool_policies.py     # Selector / Failure 策略协议与 Probe Tier 定义
+├── proxy_pool_registry.py     # 数据源状态机 SourceRegistry 与节点合并 reconcile_nodes
+├── proxy_pool_probe.py        # ProbeScheduler：失败探测与周期探测调度
+├── error_taxonomy.py          # 代理错误分类与安全文本化
 ├── proxy_bridge.py            # HTTP/HTTPS/SOCKS → localhost HTTP 代理桥与 Chromium 兼容
 ├── proxy_protocols.py         # HTTP/SOCKS/VLESS/VMess/Trojan/HY2/TUIC/SS 订阅解析
 ├── proxy_protocol_runtime.py  # Native bridge / sing-box lazy runtime 与 idle cache

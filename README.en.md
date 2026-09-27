@@ -41,6 +41,7 @@ Grok Register is a Python toolkit for automation workflow research, test-environ
 - [Usage](#usage)
 - [Configuration](#configuration)
 - [Proxy & Proxy Pool](#proxy--proxy-pool)
+- [Proxy Pool Module Architecture](#proxy-pool-module-architecture)
 - [Optional Multi-Worker Registration](#optional-multi-worker-registration)
 - [grok2api Token Pool](#grok2api-token-pool)
 - [CPA / xAI OIDC Export](#cpa--xai-oidc-export)
@@ -443,6 +444,57 @@ Within a single account attempt, the browser, email, NSFW, and default CPA all s
 
 For complete parameters, protocol mappings, runtime behavior, and health rules, see [`docs/proxy-pool.en.md`](docs/proxy-pool.en.md).
 
+### Proxy Pool Module Architecture
+
+The proxy-pool core has been split into five responsibility layers. Business code talks only to the top-level Facade and never needs to know about scheduling, health scoring, or node merging.
+
+```text
+registration_flow.py / registration_browser.py / mail_service.py
+                        │  business-layer callers
+                        │  begin/end_registration_slot()
+                        ▼
+┌──────────────────────────────────────────────────────────┐
+│ pool_api.py — ProxyPool (Facade)                        │
+│   acquire() / release() / reload() / probe() / status()  │
+│   wraps the thread-local lease, hides Manager internals  │
+└──────────────────────────────────────────────────────────┘
+                        ▼
+┌──────────────────────────────────────────────────────────┐
+│ proxy_pool_v3.py — ProxyPoolManager (core scheduler)     │
+│   _source_registry → _probe_scheduler → _runtime         │
+│   _selector        → Tier / Affinity / Health selection  │
+└──────────────────────────────────────────────────────────┘
+                        ▼
+┌──────────────────────────────────────────────────────────┐
+│ proxy_pool_policies.py   SelectorPolicy / FailurePolicy  │
+│ proxy_pool_registry.py   SourceRegistry / reconcile_nodes │
+│ proxy_pool_probe.py      ProbeScheduler                  │
+│ error_taxonomy.py        error classification           │
+└──────────────────────────────────────────────────────────┘
+```
+
+Call chain:
+
+```text
+begin_registration_slot(...)
+  → get_pool().acquire(...)
+      → manager.acquire(affinity, worker_key)
+          → _selector.select(...)
+              → _runtime.get_or_start(proxy) → ProxyLease
+end_registration_slot(success, transport_error)
+  → get_pool().release(...)
+      → manager.release(lease) → return runtime
+```
+
+Key points:
+
+- **Facade singleton**: `get_pool()` returns the single global `ProxyPool`. The lease lives in `threading.local`, so the browser, email, NSFW, and CPA steps of one account attempt all share the same exit.
+- **Source state machine**: `SourceRegistry` keeps a `SourceState` for the file source and the subscription source. When one source fails to refresh, its last successful nodes are kept and marked `stale`, so a subscription outage degrades to stale-but-usable instead of emptying the pool.
+- **Pure-function node merge**: `reconcile_nodes()` takes no locks and performs no I/O; it only diffs and merges through injected callbacks, so it can be unit-tested without pool state. A node that disappears from its source is retained and marked `retired` while leases are still in flight, so in-flight requests never reference a removed node.
+- **Probe scheduling**: `ProbeScheduler` handles immediate probes for failed nodes plus periodic probing, with health split into `HEALTHY / STALE / UNHEALTHY`.
+- **Backward compatibility**: `proxy_pool.py` keeps `from proxy_pool_v3 import *`, so existing `import proxy_pool as P; P.get_manager()` call sites still work.
+- **Cycle breaking**: The Facade and Manager are inherently mutually dependent; the `_tls()` helper resolves it with a late import instead of a circular reference.
+
 ## Optional Multi-Worker Registration
 
 Disabled by default:
@@ -562,7 +614,12 @@ Recovery uses file locks, deduplication, and atomic replacement. Repeating the o
 ├── registration_browser.py    # Chromium registration-page state and submission logic
 ├── browser_runtime.py         # Shared HTTP, Chromium Options, and proxy injection
 ├── proxy_pool.py              # Compatibility export layer for proxy_pool_v3
-├── proxy_pool_v3.py           # Proxy-pool core: Source, Lease, health, cooldown, refresh, and Probe
+├── pool_api.py                # Proxy-pool public Facade: ProxyPool singleton and thread-local lease
+├── proxy_pool_v3.py           # Proxy-pool core scheduler: Lease, health, cooldown, and selection
+├── proxy_pool_policies.py     # Selector / Failure policy protocols and probe-tier definitions
+├── proxy_pool_registry.py     # SourceRegistry state machine and reconcile_nodes merge
+├── proxy_pool_probe.py        # ProbeScheduler: failure probes and periodic probe scheduling
+├── error_taxonomy.py          # Proxy error classification and safe textification
 ├── proxy_bridge.py            # HTTP/HTTPS/SOCKS → localhost HTTP proxy bridge and Chromium compatibility
 ├── proxy_protocols.py         # HTTP/SOCKS/VLESS/VMess/Trojan/HY2/TUIC/SS subscription parsing
 ├── proxy_protocol_runtime.py  # Native bridge / sing-box lazy runtime and idle cache
