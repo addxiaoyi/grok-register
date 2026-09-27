@@ -19,6 +19,7 @@ from curl_cffi import requests
 
 from proxy_protocol_runtime import ProtocolRuntimeManager
 from proxy_protocols import ProxyDescriptor, ProxyProtocolError, parse_proxy_line, parse_subscription_source
+from error_taxonomy import classify_proxy_network_error, is_transport_error_text
 
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 _MAX_SOURCE_BYTES = 2 << 20
@@ -175,56 +176,8 @@ def _expand_account_placeholder(proxy_url, session_key):
     return proxy_url.replace("{account}", session_key) if "{account}" in proxy_url else proxy_url
 
 
-def classify_proxy_network_error(value):
-    """Return compatibility/configuration/hard_transport/suspected_transport/application."""
-    kind = getattr(value, "kind", "")
-    if kind in {"socks_auth", "http_proxy_auth", "configuration"}:
-        return "configuration"
-    if kind in {"upstream_connect", "http_connect", "socks_connect"}:
-        return "hard_transport"
-    if kind in {"https_proxy_tls", "remote_reset", "local_dns", "remote_dns", "bridge"}:
-        return "suspected_transport"
-    text = str(value or "").lower()
-    if not text:
-        return "application"
-    compatibility = (
-        "unknown url type", "unsupported proxy scheme", "http-compatible proxy endpoint",
-        "does not support scheme", "代理协议不受", "proxy scheme is unsupported",
-        "unsupported proxy protocol", "native-only",
-    )
-    if any(marker in text for marker in compatibility):
-        return "compatibility"
-    configuration = (
-        "proxy authentication", "proxy auth", "authentication failed", "authentication method rejected",
-        "credentials rejected", "credential", "http_proxy_auth", "socks_auth", "407 proxy authentication",
-    )
-    if any(marker in text for marker in configuration):
-        return "configuration"
-    hard = (
-        "socks4 connect failed", "socks5 connect failed", "proxy connection failed", "proxy server refused",
-        "tunnel connection failed", "could not connect to proxy", "failed to connect to proxy",
-        "err_proxy_connection_failed", "err_tunnel_connection_failed", "connection refused",
-        "no route to host", "network is unreachable", "upstream_connect", "http_connect", "socks_connect",
-    )
-    if any(marker in text for marker in hard):
-        return "hard_transport"
-    suspected = (
-        "tls connect error", "ssl", "handshake", "unexpected eof", "unexpected_eof",
-        "connection reset", "connection aborted", "remote end closed", "broken pipe",
-        "timed out", "timeout", "temporarily unavailable", "connect error", "failed to connect",
-        "could not connect", "remote_reset", "https_proxy_tls", "local_dns", "remote_dns",
-    )
-    if any(marker in text for marker in suspected):
-        return "suspected_transport"
-    return "application"
-
-
-def _is_transport_error_text(value):
-    return is_transport_error_text(value)
-
-
 def is_proxy_transport_exception(exc):
-    return isinstance(exc, ProxyTransportError) or _is_transport_error_text(exc)
+    return isinstance(exc, ProxyTransportError) or is_transport_error_text(exc)
 
 
 def _public_ip(address):
