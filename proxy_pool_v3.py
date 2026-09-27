@@ -19,12 +19,23 @@ from curl_cffi import requests
 
 from proxy_protocol_runtime import ProtocolRuntimeManager
 from proxy_protocols import ProxyDescriptor, ProxyProtocolError, parse_proxy_line, parse_subscription_source
+from error_taxonomy import classify_proxy_network_error, is_transport_error_text
+from proxy_pool_registry import SourceRegistry, reconcile_nodes
+from proxy_pool_policies import (
+    DefaultSelectorPolicy,
+    DefaultFailurePolicy,
+    SelectorPolicy,
+    FailurePolicy,
+)
+from proxy_pool_probe import ProbeScheduler
+from pool_api import ProxyPool
 
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 _MAX_SOURCE_BYTES = 2 << 20
 _TLS = threading.local()
 _MANAGER_LOCK = threading.RLock()
 _MANAGER = None
+_POOL = None
 
 
 class ProxyPoolError(RuntimeError):
@@ -108,16 +119,6 @@ class ProxyLease:
     suspected_feedback: bool = False
 
 
-@dataclass
-class SourceState:
-    descriptors: List[ProxyDescriptor] = field(default_factory=list)
-    last_success_at: Optional[float] = None
-    last_error: str = ""
-    generation: int = 0
-    diagnostics: Dict = field(default_factory=dict)
-    configured: bool = False
-
-
 def _config_signature(config):
     keys = (
         "proxy_mode", "proxy", "proxy_fallback", "proxy_pool_file",
@@ -175,56 +176,8 @@ def _expand_account_placeholder(proxy_url, session_key):
     return proxy_url.replace("{account}", session_key) if "{account}" in proxy_url else proxy_url
 
 
-def classify_proxy_network_error(value):
-    """Return compatibility/configuration/hard_transport/suspected_transport/application."""
-    kind = getattr(value, "kind", "")
-    if kind in {"socks_auth", "http_proxy_auth", "configuration"}:
-        return "configuration"
-    if kind in {"upstream_connect", "http_connect", "socks_connect"}:
-        return "hard_transport"
-    if kind in {"https_proxy_tls", "remote_reset", "local_dns", "remote_dns", "bridge"}:
-        return "suspected_transport"
-    text = str(value or "").lower()
-    if not text:
-        return "application"
-    compatibility = (
-        "unknown url type", "unsupported proxy scheme", "http-compatible proxy endpoint",
-        "does not support scheme", "代理协议不受", "proxy scheme is unsupported",
-        "unsupported proxy protocol", "native-only",
-    )
-    if any(marker in text for marker in compatibility):
-        return "compatibility"
-    configuration = (
-        "proxy authentication", "proxy auth", "authentication failed", "authentication method rejected",
-        "credentials rejected", "credential", "http_proxy_auth", "socks_auth", "407 proxy authentication",
-    )
-    if any(marker in text for marker in configuration):
-        return "configuration"
-    hard = (
-        "socks4 connect failed", "socks5 connect failed", "proxy connection failed", "proxy server refused",
-        "tunnel connection failed", "could not connect to proxy", "failed to connect to proxy",
-        "err_proxy_connection_failed", "err_tunnel_connection_failed", "connection refused",
-        "no route to host", "network is unreachable", "upstream_connect", "http_connect", "socks_connect",
-    )
-    if any(marker in text for marker in hard):
-        return "hard_transport"
-    suspected = (
-        "tls connect error", "ssl", "handshake", "unexpected eof", "unexpected_eof",
-        "connection reset", "connection aborted", "remote end closed", "broken pipe",
-        "timed out", "timeout", "temporarily unavailable", "connect error", "failed to connect",
-        "could not connect", "remote_reset", "https_proxy_tls", "local_dns", "remote_dns",
-    )
-    if any(marker in text for marker in suspected):
-        return "suspected_transport"
-    return "application"
-
-
-def _is_transport_error_text(value):
-    return classify_proxy_network_error(value) in ("hard_transport", "suspected_transport")
-
-
 def is_proxy_transport_exception(exc):
-    return isinstance(exc, ProxyTransportError) or _is_transport_error_text(exc)
+    return isinstance(exc, ProxyTransportError) or is_transport_error_text(exc)
 
 
 def _public_ip(address):
@@ -279,10 +232,13 @@ class ProxyPoolManager:
         self._last_refresh = 0.0
         self._last_probe_all = 0.0
         self._probe_all_running = False
-        self._source_states = {"file": SourceState(), "subscription": SourceState()}
+        self._source_registry = SourceRegistry(self.config, self.log)
         self._source_diagnostics = {}
         self._persisted_state = self._load_state_file()
         self._runtime = ProtocolRuntimeManager(self.config, log=self.log)
+        self._selector: SelectorPolicy = DefaultSelectorPolicy()
+        self._failure_policy: FailurePolicy = DefaultFailurePolicy()
+        self._probe_scheduler = ProbeScheduler(self)
         self.reload_sources(force=True)
 
     @property
@@ -419,36 +375,6 @@ class ProxyPoolManager:
             raise ProxyPoolError("代理订阅内容超过 2 MiB 限制")
         return parse_subscription_source(body)
 
-    def _refresh_source(self, name, loader):
-        state = self._source_states[name]
-        configured = bool(self.config.get("proxy_pool_file") if name == "file" else self.config.get("proxy_pool_subscription_url"))
-        state.configured = configured
-        if not configured:
-            state.descriptors = []
-            state.last_error = ""
-            state.diagnostics = {}
-            return
-        try:
-            result = loader()
-            if result is None:
-                state.descriptors = []
-                return
-            state.descriptors = list(result.nodes)
-            state.last_success_at = time.time()
-            state.last_error = ""
-            state.generation += 1
-            state.diagnostics = result.as_dict()
-            state.diagnostics.update({"stale": False, "generation": state.generation, "last_success_at": state.last_success_at})
-            if result.skipped:
-                self.log("[!] %s 跳过 %s 个无法解析的节点" % (name, result.skipped))
-        except Exception as exc:
-            state.last_error = safe_proxy_error_text(exc)
-            if state.descriptors:
-                state.diagnostics = dict(state.diagnostics)
-                state.diagnostics.update({"stale": True, "error": state.last_error, "generation": state.generation})
-                self.log("[!] %s 刷新失败，继续使用最近一次成功节点: %s" % (name, state.last_error))
-            else:
-                state.diagnostics = {"stale": True, "error": state.last_error, "generation": state.generation}
 
     def _source_entries(self):
         if self.mode == "single":
@@ -458,21 +384,13 @@ class ProxyPoolManager:
                 raise ProxyPoolError(str(exc)) from exc
         if self.mode != "pool":
             return []
-        self._refresh_source("file", self._read_file_source)
-        self._refresh_source("subscription", self._fetch_subscription)
-        values = []
-        for name in ("file", "subscription"):
-            values.extend((name, item) for item in self._source_states[name].descriptors)
-        unique, seen = [], set()
-        for source, descriptor in values:
-            if descriptor.node_id not in seen:
-                seen.add(descriptor.node_id); unique.append((source, descriptor))
-        self._source_diagnostics = {name: dict(state.diagnostics) for name, state in self._source_states.items() if state.configured}
-        if not unique:
-            errors = [state.last_error for state in self._source_states.values() if state.last_error]
-            detail = "; ".join(errors) if errors else "未配置代理池文件或订阅"
-            raise ProxyPoolError("代理池没有可用节点: %s" % detail)
-        return unique
+        loaders = {
+            "file": self._read_file_source,
+            "subscription": self._fetch_subscription,
+        }
+        entries = self._source_registry.collect(loaders)
+        self._source_diagnostics = self._source_registry.diagnostics
+        return entries
 
     def _reload_sources_locked(self, force=False):
         """Refresh sources while the dedicated refresh lock is held."""
@@ -482,26 +400,18 @@ class ProxyPoolManager:
                 return self.snapshot()
         entries = self._source_entries()
         with self._condition:
-            previous, updated = self._nodes, {}
-            for source, descriptor in entries:
-                node_id = descriptor.node_id
-                old = previous.get(node_id)
-                if old is not None:
-                    old.source, old.proxy_url, old.descriptor = source, descriptor.canonical_uri, descriptor
-                    old.protocol, old.name, old.backend = descriptor.protocol, descriptor.name, descriptor.backend
-                    old.rotating, old.retired = self._rotating_for(descriptor), False
-                    updated[node_id] = old
-                else:
-                    node = ProxyNode(
-                        id=node_id, source=source, proxy_url=descriptor.canonical_uri, descriptor=descriptor,
-                        protocol=descriptor.protocol, name=descriptor.name, backend=descriptor.backend,
-                        rotating=self._rotating_for(descriptor),
-                    )
-                    self._restore_node_state(node)
-                    updated[node_id] = node
-            for node_id, old in previous.items():
-                if node_id not in updated and old.inflight > 0:
-                    old.retired = True; updated[node_id] = old
+            previous = self._nodes
+            updated = reconcile_nodes(
+                previous,
+                entries,
+                lambda src, desc: ProxyNode(
+                    id=desc.node_id, source=src, proxy_url=desc.canonical_uri, descriptor=desc,
+                    protocol=desc.protocol, name=desc.name, backend=desc.backend,
+                    rotating=self._rotating_for(desc),
+                ),
+                self._rotating_for,
+                self._restore_node_state,
+            )
             self._nodes = updated
             self._last_refresh = now
             self._condition.notify_all()
@@ -537,18 +447,7 @@ class ProxyPoolManager:
             self._refresh_lock.release()
 
     def _schedule_periodic_probe_if_due(self):
-        if not self.managed or self.probe_interval <= 0:
-            return
-        now = time.time()
-        with self._lock:
-            if self._probe_all_running or now - self._last_probe_all < self.probe_interval:
-                return
-            self._probe_all_running = True; self._last_probe_all = now
-        def runner():
-            try: self.probe_all(force=True)
-            finally:
-                with self._lock: self._probe_all_running = False
-        threading.Thread(target=runner, name="proxy-probe-all", daemon=True).start()
+        return self._probe_scheduler.schedule_periodic_probe_if_due()
 
     def _eligible_locked(self, now):
         return [
@@ -568,9 +467,8 @@ class ProxyPoolManager:
         return 1
 
     def _select_locked(self, nodes, affinity):
-        now = time.time()
-        best_tier = min(self._probe_tier(node, now) for node in nodes)
-        pool = sorted((node for node in nodes if self._probe_tier(node, now) == best_tier), key=lambda value: value.id)
+        best_tier = min(self._probe_tier(node, time.time()) for node in nodes)
+        pool = sorted((node for node in nodes if self._probe_tier(node, time.time()) == best_tier), key=lambda value: value.id)
         digest = hashlib.sha256(str(affinity or "").encode("utf-8")).digest()
         selected = pool[int.from_bytes(digest[:8], "big") % len(pool)]
         if selected.rotating or selected.health >= 0.8 or len(pool) == 1:
@@ -707,13 +605,9 @@ class ProxyPoolManager:
             if node is None: return
             self._count_feedback_sample(node, lease)
             node.transport_failures += 1; node.last_failure_at = time.time()
-            if node.rotating:
-                node.exit_failures += 1; node.last_error = "transport: rotating exit"; self._condition.notify_all()
-            else:
-                node.failure_count += 1; node.health = max(0.05, node.health * 0.7)
-                cooldown = min(600, 30 * (2 ** min(max(node.failure_count - 1, 0), 4)))
-                node.cooldown_until = time.time() + cooldown; node.last_error = "transport"; node_for_probe = node.id
-                self._condition.notify_all()
+            self._failure_policy.apply_transport_failure(node, is_rotating=node.rotating)
+            node_for_probe = None if node.rotating else node.id
+            self._condition.notify_all()
         self._save_state_file()
         if node_for_probe and schedule_probe: self._schedule_failure_probe(node_for_probe)
 
@@ -824,37 +718,15 @@ class ProxyPoolManager:
         return {"status": value.status, "tested_at": value.tested_at, "latency_ms": value.latency_ms, "exit_ip": value.exit_ip, "error": value.error}
 
     def _schedule_failure_probe(self, node_id, penalize_on_failure=False, suspected_error=None, lease=None):
-        with self._lock:
-            existing = self._probe_events.get(node_id)
-            if existing is not None and not existing.is_set(): return
-            event = threading.Event(); self._probe_events[node_id] = event
-        def runner():
-            try:
-                result = self.probe_node(node_id)
-                if penalize_on_failure and result.get("status") != "healthy":
-                    self._apply_transport_failure(node_id, suspected_error or result.get("error") or "probe failed", schedule_probe=False, lease=lease)
-            except Exception:
-                if penalize_on_failure:
-                    self._apply_transport_failure(node_id, suspected_error or "probe failed", schedule_probe=False, lease=lease)
-            finally:
-                event.set()
-                with self._lock:
-                    if self._probe_events.get(node_id) is event: self._probe_events.pop(node_id, None)
-        threading.Thread(target=runner, name="proxy-probe-%s" % node_id[:8], daemon=True).start()
+        return self._probe_scheduler.schedule_failure_probe(
+            node_id,
+            penalize_on_failure=penalize_on_failure,
+            suspected_error=suspected_error,
+            lease=lease,
+        )
 
     def probe_all(self, force=False):
-        now = time.time()
-        with self._lock:
-            if not force and self.probe_interval > 0 and now - self._last_probe_all < self.probe_interval: return []
-            node_ids = [node.id for node in self._nodes.values() if not node.retired]; self._last_probe_all = now
-        results = []
-        if not node_ids: return results
-        with ThreadPoolExecutor(max_workers=min(8, len(node_ids)), thread_name_prefix="proxy-probe") as executor:
-            futures = {executor.submit(self.probe_node, node_id): node_id for node_id in node_ids}
-            for future in as_completed(futures):
-                try: results.append(future.result())
-                except Exception as exc: results.append({"id": futures[future], "status": "unhealthy", "error": safe_proxy_error_text(exc)})
-        return results
+        return self._probe_scheduler.probe_all(force=force)
 
     def preflight_node(self, node_id):
         """Non-destructive reachability test against registration-path origins."""
@@ -909,7 +781,7 @@ class ProxyPoolManager:
 
 
 def get_manager(config=None, log=None):
-    global _MANAGER
+    global _MANAGER, _POOL
     if config is None:
         from app_config import config as app_config
         config = app_config
@@ -917,63 +789,63 @@ def get_manager(config=None, log=None):
     with _MANAGER_LOCK:
         if _MANAGER is None:
             _MANAGER = ProxyPoolManager(config, log=log)
+            _POOL = ProxyPool(_MANAGER)
         elif _MANAGER.signature != signature and _MANAGER.total_inflight() == 0:
-            old = _MANAGER; _MANAGER = ProxyPoolManager(config, log=log); old.shutdown()
+            old = _MANAGER; _MANAGER = ProxyPoolManager(config, log=log); _POOL = ProxyPool(_MANAGER); old.shutdown()
         elif log is not None:
             _MANAGER.log = log; _MANAGER._runtime.log = log
         return _MANAGER
 
 
+def get_pool(config=None, log=None) -> ProxyPool:
+    """Return the process-wide pool facade, creating the manager on first use."""
+    get_manager(config=config, log=log)
+    return _POOL
+
+
 def reset_manager():
-    global _MANAGER
+    global _MANAGER, _POOL
     with _MANAGER_LOCK:
         if _MANAGER is not None and _MANAGER.total_inflight() > 0:
             raise ProxyPoolError("仍有代理租约使用中，不能重置代理池")
-        old = _MANAGER; _MANAGER = None
+        old = _MANAGER; _MANAGER = None; _POOL = None
     if old is not None: old.shutdown()
 
 
-def current_proxy_lease(): return getattr(_TLS, "lease", None)
+def current_proxy_lease():
+    lease = getattr(_TLS, "lease", None)
+    if lease is not None:
+        return get_pool().lease
+    return None
 def current_proxy_url():
     lease = current_proxy_lease(); return None if lease is None else str(lease.proxy_url or "")
 def managed_proxy_active(): return current_proxy_lease() is not None
 
 
 def begin_registration_slot(slot_index, attempt_index=1, worker_key=None, log=None, cancel_callback=None):
-    if current_proxy_lease() is not None: raise ProxyPoolError("当前线程已有未释放的代理租约")
-    manager = get_manager(log=log)
-    if not manager.managed: return None
-    worker = str(worker_key or threading.current_thread().name or "worker"); slot = int(slot_index); attempt = int(attempt_index)
-    affinity = "%s:slot:%s" % (worker, slot)
-    session_seed = "%s:%s:%s:%s" % (worker, slot, attempt, secrets.token_hex(8))
-    session_key = hashlib.sha256(session_seed.encode("utf-8")).hexdigest()[:16]
-    lease = manager.acquire(affinity=affinity, worker_key=worker, slot_index=slot, attempt_index=attempt, session_key=session_key, cancel_callback=cancel_callback)
-    _TLS.lease = lease
-    if log is not None:
-        label = lease.source_uri or lease.proxy_url; log("[*] 当前账号代理: %s" % proxy_log_label(label))
-        if lease.source_uri and lease.proxy_url and lease.source_uri != lease.proxy_url: log("[*] 当前代理本地出口: %s" % lease.proxy_url)
+    pool = get_pool(config=None, log=log)
+    lease = pool.acquire(slot_index, attempt_index=attempt_index, worker_key=worker_key, cancel_callback=cancel_callback)
+    if lease is not None and log is not None:
+        label = lease.source_uri or lease.proxy_url
+        log("[*] 当前账号代理: %s" % proxy_log_label(label))
+        if lease.source_uri and lease.proxy_url and lease.source_uri != lease.proxy_url:
+            log("[*] 当前代理本地出口: %s" % lease.proxy_url)
     return lease
 
 
 def end_registration_slot(success=False, transport_error=None):
-    lease = current_proxy_lease()
-    if lease is None: return
-    manager = get_manager()
-    try:
-        if transport_error is not None: manager.report_transport_failure(lease, transport_error)
-        elif success: manager.report_success(lease)
-    finally:
-        manager.release(lease); _TLS.lease = None
+    pool = get_pool()
+    pool.release(success=success, transport_error=transport_error)
 
 
 def report_current_transport_failure(error):
-    lease = current_proxy_lease()
-    if lease is not None: get_manager().report_transport_failure(lease, error)
+    pool = get_pool()
+    pool.report_transport_failure(error)
 
 
 def report_current_suspected_transport_failure(error):
-    lease = current_proxy_lease()
-    if lease is not None: get_manager().report_suspected_transport_failure(lease, error)
+    pool = get_pool()
+    pool.report_suspected_transport_failure(error)
 
 
 def manager_snapshot(config=None):

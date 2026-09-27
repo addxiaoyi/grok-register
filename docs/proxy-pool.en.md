@@ -447,3 +447,113 @@ Under the project's current local-use model, the WebUI, status API, and related 
 The V3 behavior described here is concentrated in managed `single` / `pool` mode. The default `proxy_mode=auto` continues to preserve the legacy GUI/CLI/WebUI, email, result persistence, pending, token sync, and proxy behavior.
 
 Ordinary HTTP/SOCKS does not start sing-box merely because advanced-protocol support exists. VLESS/VMess/Trojan/Hysteria2/TUIC/Shadowsocks require sing-box only when actually acquired, probed, or preflighted.
+
+## Refactored Architecture (v3 Module Layout)
+
+### Five-layer responsibility split
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  registration_flow.py / registration_browser.py / mail_service.py │
+│                       (business-layer callers)                     │
+└─────────────────────────────────────────────────────────────────────┘
+                               │
+                               │ begin/end_registration_slot()
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                        pool_api.py                                   │
+│                        ProxyPool (Facade)                            │
+│  acquire(slot, attempt, worker_key) → lease                           │
+│  release(success, transport_error) → return node                      │
+│  reload() / probe() / shutdown() / status()                           │
+│  ─── Thin wrapper over get_pool(), encapsulating thread-local leases │
+└─────────────────────────────────────────────────────────────────────┘
+                               │
+                               │ lifecycle / health / probe delegation
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                     proxy_pool_v3.py / proxy_pool.py               │
+│                      ProxyPoolManager (core scheduler)               │
+│  ├─ _source_registry   → source state machine                       │
+│  ├─ _probe_scheduler   → periodic / per-node probe scheduling       │
+│  ├─ _runtime           → sing-box / proxy bridge lifecycle          │
+│  └─ _selector          → Tier decision, affinity, health selection  │
+│                                                                    │
+│  proxy_pool.py: backward-compatibility facade                        │
+│  from proxy_pool_v3 import *                                         │
+└─────────────────────────────────────────────────────────────────────┘
+                               │
+                               ▼ state machine / policies
+┌─────────────────────────────────────────────────────────────────────┐
+│  proxy_pool_policies.py                                             │
+│  ├─ SelectorPolicy     → selection policy protocol                  │
+│  └─ FailurePolicy      → failure-penalty protocol                   │
+│  PROBE_TIER_{HEALTHY|STALE|UNHEALTHY}                               │
+└─────────────────────────────────────────────────────────────────────┘
+                               │
+                               ▼ error classification
+┌─────────────────────────────────────────────────────────────────────┐
+│  error_taxonomy.py                                                 │
+│  proxy_error_to_category()      → five outcome categories          │
+│  safe_proxy_error_text()        → safe error textification         │
+└─────────────────────────────────────────────────────────────────────┘
+                               │
+                               ▼ source / node management
+┌─────────────────────────────────────────────────────────────────────┐
+│  proxy_pool_registry.py                                            │
+│  ├─ SourceState                  → per-source success/error/generation │
+│  ├─ SourceRegistry               → collect(loaders) → deduped nodes │
+│  └─ reconcile_nodes(prev, entries) → pure diff + merge             │
+└─────────────────────────────────────────────────────────────────────┘
+                               │
+                               ▼ probe scheduling
+┌─────────────────────────────────────────────────────────────────────┐
+│  proxy_pool_probe.py                                               │
+│  ProbeScheduler                                                   │
+│  ├─ schedule_failure_probe(lease, error)                           │
+│  ├─ probe_all(force=False)                                         │
+│  └─ schedule_periodic_probe_if_due()                               │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Thread-local lease model
+
+```text
+TLS (threading.local)
+    └─ lease : ProxyLease | None
+            ↕
+        begin_registration_slot() → set
+        end_registration_slot()   → clear
+```
+
+One lease per account attempt; every in-flow request on that thread uses the same exit.
+
+### `begin_registration_slot` → `end_registration_slot` call chain
+
+```text
+registration_flow.py
+    └─ begin_registration_slot(slot_index, attempt_index, worker_key, log)
+            └─ get_pool().acquire(slot_index, ...)
+                    └─ manager.acquire(affinity, worker_key, ...)
+                            └─ _selector.select(...)
+                                    └─ _runtime.get_or_start(proxy) → lease
+    └─ end_registration_slot(success, transport_error)
+            └─ get_pool().release(success, ...)
+                    └─ manager.release(lease)
+                            └─ _runtime.release(lease) → return sing-box / bridge
+```
+
+### Key dependency-injection points
+
+| Module | Primary dependencies | Cycle avoidance |
+|--------|----------------------|-----------------|
+| `pool_api.py` | `proxy_pool_v3._TLS`, `proxy_pool_v3.ProxyPoolError` | Late-imported through `_tls()` helper |
+| `proxy_pool_v3.py` | `proxy_pool_policies`, `proxy_pool_registry`, `proxy_pool_probe`, `error_taxonomy`, `proxy_protocol_runtime` | Top-level deps only point inward |
+| `proxy_pool_registry.py` | `error_taxonomy.safe_proxy_error_text` | Late-imported |
+| `proxy_pool_probe.py` | `error_taxonomy.safe_proxy_error_text` | Late-imported |
+
+### Backward compatibility
+
+- `proxy_pool.py` re-exports `from proxy_pool_v3 import *`
+- `registration_flow.begin_registration_slot` remains the primary entry point
+- Legacy code that does `import proxy_pool as P; P.get_manager()` continues to work

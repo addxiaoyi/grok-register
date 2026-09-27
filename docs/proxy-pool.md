@@ -449,3 +449,113 @@ POST /api/proxy-pool/preflight?node_id=<node-id>
 本轮 V3 行为集中在 `single` / `pool` managed 模式。默认 `proxy_mode=auto` 继续保持旧 GUI/CLI/WebUI、邮箱、结果落盘、pending、token sync 与历史代理行为。
 
 普通 HTTP/SOCKS 不会因为高级协议支持而启动 sing-box；VLESS/VMess/Trojan/Hysteria2/TUIC/Shadowsocks 只有在实际 acquire / probe / preflight 时才需要 sing-box。
+
+## Refactored Architecture（v3 模块化划分）
+
+### 五层职责分离
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  registration_flow.py / registration_browser.py / mail_service.py │
+│                         (业务层调用方)                              │
+└─────────────────────────────────────────────────────────────────────┘
+                               │
+                               │ begin/end_registration_slot()
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                         pool_api.py                                 │
+│                         ProxyPool (Facade)                            │
+│  acquire(slot, attempt, worker_key) → lease                           │
+│  release(success, transport_error) → 归还节点                          │
+│  reload() / probe() / shutdown() / status()                             │
+│  ─── 薄包装 get_pool()，封装线程本地租约 management                   │
+└─────────────────────────────────────────────────────────────────────┘
+                               │
+                               │ 生命周期/健康/探测委托
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                     proxy_pool_v3.py / proxy_pool.py                │
+│                        ProxyPoolManager (核心调度器)                   │
+│  ├─ _source_registry   → 来自不同文件的源状态机                     │
+│  ├─ _probe_scheduler   → 周期/单节点探测安排                          │
+│  ├─ _runtime           → sing-box / 代理桥接 lifecycle                │
+│  └─ _selector          → Tier 决策、Affinity、Health 选择                │
+│                                                                       │
+│  proxy_pool.py: 兼容性面向入口                                                │
+│  from proxy_pool_v3 import *                                         │
+└─────────────────────────────────────────────────────────────────────┘
+                               │
+                               ▼ 状态机/策略
+┌─────────────────────────────────────────────────────────────────────┐
+│  proxy_pool_policies.py                                             │
+│  ├─ SelectorPolicy     → 选取策略协议 (DefaultSelectorPolicy)       │
+│  └─ FailurePolicy      → 失败处罚协议                               │
+│  PROBE_TIER_{HEALTHY|STALE|UNHEALTHY}                                │
+└─────────────────────────────────────────────────────────────────────┘
+                               │
+                               ▼ 错误分类
+┌─────────────────────────────────────────────────────────────────────┐
+│  error_taxonomy.py                                                │
+│  proxy_error_to_category()      → 5 类错误语义                   │
+│  safe_proxy_error_text()        → 错误文本化                       │
+└─────────────────────────────────────────────────────────────────────┘
+                               │
+                               ▼ 源/节点管理
+┌─────────────────────────────────────────────────────────────────────┐
+│  proxy_pool_registry.py                                           │
+│  ├─ SourceState                  → 单一源的 last_success/error/gen │
+│  ├─ SourceRegistry               → collect(loaders) → 去重节点列表 │
+│  └─ reconcile_nodes(prev, entries) → 纯函数，diff + 合并         │
+└─────────────────────────────────────────────────────────────────────┘
+                               │
+                               ▼ 探测调度
+┌─────────────────────────────────────────────────────────────────────┐
+│  proxy_pool_probe.py                                                │
+│  ProbeScheduler                                                            │
+│  ├─ schedule_failure_probe(lease, error)                             │
+│  ├─ probe_all(force=False)                                         │
+│  └─ schedule_periodic_probe_if_due()                               │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 线程本地租约模型
+
+```text
+TLS (threading.local)
+    └─ lease : ProxyLease | None
+            ↕
+        begin_registration_slot() → 设置
+        end_registration_slot()   → 清除
+```
+
+每个账号 attempt 对应唯一 lease，跨页面/跨请求同一个出口。
+
+### `begin_registration_slot` → `end_registration_slot` 呼叫链
+
+```text
+registration_flow.py
+    └─ begin_registration_slot(slot_index, attempt_index, worker_key, log)
+            └─ get_pool().acquire(slot_index, ...)
+                    └─ manager.acquire(affinity, worker_key, ...)
+                            └─ _selector.select(...)
+                                    └─ _runtime.get_or_start(proxy) → lease
+    └─ end_registration_slot(success, transport_error)
+            └─ get_pool().release(success, ...)
+                    └─ manager.release(lease)
+                            └─ _runtime.release(lease) → 归还 sing-box / bridge
+```
+
+### 关键依赖注入点
+
+| 模块 | 主要依赖 | 避免的循环 |
+|------|----------|-----------|
+| `pool_api.py` | `proxy_pool_v3._TLS`, `proxy_pool_v3.ProxyPoolError` | 通过 `_tls()` 延迟导入 |
+| `proxy_pool_v3.py` | `proxy_pool_policies`, `proxy_pool_registry`, `proxy_pool_probe`, `error_taxonomy`, `proxy_protocol_runtime` | 入口向内层依赖 |
+| `proxy_pool_registry.py` | `error_taxonomy.safe_proxy_error_text` | 延迟导入 |
+| `proxy_pool_probe.py` | `error_taxonomy.safe_proxy_error_text` | 延迟导入 |
+
+### 向后兼容
+
+- `proxy_pool.py` 导出 `from proxy_pool_v3 import *`
+- `registration_flow.begin_registration_slot` 仍是主要入口
+- 任何旧代码通过 `import proxy_pool as P; P.get_manager()` 仍可使用

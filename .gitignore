@@ -21,6 +21,7 @@ proxy_pool_state.json
 .DS_Store
 .idea/
 .vscode/
+.trae-html-share-packages/
 DrissionPage/
 autoPortData/
 cpa_auths/
