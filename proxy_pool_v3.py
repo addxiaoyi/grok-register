@@ -27,6 +27,7 @@ from proxy_pool_policies import (
     SelectorPolicy,
     FailurePolicy,
 )
+from proxy_pool_probe import ProbeScheduler
 
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 _MAX_SOURCE_BYTES = 2 << 20
@@ -245,6 +246,7 @@ class ProxyPoolManager:
         self._runtime = ProtocolRuntimeManager(self.config, log=self.log)
         self._selector: SelectorPolicy = DefaultSelectorPolicy()
         self._failure_policy: FailurePolicy = DefaultFailurePolicy()
+        self._probe_scheduler = ProbeScheduler(self)
         self.reload_sources(force=True)
 
     @property
@@ -491,18 +493,7 @@ class ProxyPoolManager:
             self._refresh_lock.release()
 
     def _schedule_periodic_probe_if_due(self):
-        if not self.managed or self.probe_interval <= 0:
-            return
-        now = time.time()
-        with self._lock:
-            if self._probe_all_running or now - self._last_probe_all < self.probe_interval:
-                return
-            self._probe_all_running = True; self._last_probe_all = now
-        def runner():
-            try: self.probe_all(force=True)
-            finally:
-                with self._lock: self._probe_all_running = False
-        threading.Thread(target=runner, name="proxy-probe-all", daemon=True).start()
+        return self._probe_scheduler.schedule_periodic_probe_if_due()
 
     def _eligible_locked(self, now):
         return [
@@ -773,37 +764,15 @@ class ProxyPoolManager:
         return {"status": value.status, "tested_at": value.tested_at, "latency_ms": value.latency_ms, "exit_ip": value.exit_ip, "error": value.error}
 
     def _schedule_failure_probe(self, node_id, penalize_on_failure=False, suspected_error=None, lease=None):
-        with self._lock:
-            existing = self._probe_events.get(node_id)
-            if existing is not None and not existing.is_set(): return
-            event = threading.Event(); self._probe_events[node_id] = event
-        def runner():
-            try:
-                result = self.probe_node(node_id)
-                if penalize_on_failure and result.get("status") != "healthy":
-                    self._apply_transport_failure(node_id, suspected_error or result.get("error") or "probe failed", schedule_probe=False, lease=lease)
-            except Exception:
-                if penalize_on_failure:
-                    self._apply_transport_failure(node_id, suspected_error or "probe failed", schedule_probe=False, lease=lease)
-            finally:
-                event.set()
-                with self._lock:
-                    if self._probe_events.get(node_id) is event: self._probe_events.pop(node_id, None)
-        threading.Thread(target=runner, name="proxy-probe-%s" % node_id[:8], daemon=True).start()
+        return self._probe_scheduler.schedule_failure_probe(
+            node_id,
+            penalize_on_failure=penalize_on_failure,
+            suspected_error=suspected_error,
+            lease=lease,
+        )
 
     def probe_all(self, force=False):
-        now = time.time()
-        with self._lock:
-            if not force and self.probe_interval > 0 and now - self._last_probe_all < self.probe_interval: return []
-            node_ids = [node.id for node in self._nodes.values() if not node.retired]; self._last_probe_all = now
-        results = []
-        if not node_ids: return results
-        with ThreadPoolExecutor(max_workers=min(8, len(node_ids)), thread_name_prefix="proxy-probe") as executor:
-            futures = {executor.submit(self.probe_node, node_id): node_id for node_id in node_ids}
-            for future in as_completed(futures):
-                try: results.append(future.result())
-                except Exception as exc: results.append({"id": futures[future], "status": "unhealthy", "error": safe_proxy_error_text(exc)})
-        return results
+        return self._probe_scheduler.probe_all(force=force)
 
     def preflight_node(self, node_id):
         """Non-destructive reachability test against registration-path origins."""
