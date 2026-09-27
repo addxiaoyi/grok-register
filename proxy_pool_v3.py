@@ -242,6 +242,8 @@ class ProxyPoolManager:
         self._source_diagnostics = {}
         self._persisted_state = self._load_state_file()
         self._runtime = ProtocolRuntimeManager(self.config, log=self.log)
+        self._selector: SelectorPolicy = DefaultSelectorPolicy()
+        self._failure_policy: FailurePolicy = DefaultFailurePolicy()
         self.reload_sources(force=True)
 
     @property
@@ -527,9 +529,8 @@ class ProxyPoolManager:
         return 1
 
     def _select_locked(self, nodes, affinity):
-        now = time.time()
-        best_tier = min(self._probe_tier(node, now) for node in nodes)
-        pool = sorted((node for node in nodes if self._probe_tier(node, now) == best_tier), key=lambda value: value.id)
+        best_tier = min(self._probe_tier(node, time.time()) for node in nodes)
+        pool = sorted((node for node in nodes if self._probe_tier(node, time.time()) == best_tier), key=lambda value: value.id)
         digest = hashlib.sha256(str(affinity or "").encode("utf-8")).digest()
         selected = pool[int.from_bytes(digest[:8], "big") % len(pool)]
         if selected.rotating or selected.health >= 0.8 or len(pool) == 1:
@@ -666,13 +667,9 @@ class ProxyPoolManager:
             if node is None: return
             self._count_feedback_sample(node, lease)
             node.transport_failures += 1; node.last_failure_at = time.time()
-            if node.rotating:
-                node.exit_failures += 1; node.last_error = "transport: rotating exit"; self._condition.notify_all()
-            else:
-                node.failure_count += 1; node.health = max(0.05, node.health * 0.7)
-                cooldown = min(600, 30 * (2 ** min(max(node.failure_count - 1, 0), 4)))
-                node.cooldown_until = time.time() + cooldown; node.last_error = "transport"; node_for_probe = node.id
-                self._condition.notify_all()
+            self._failure_policy.apply_transport_failure(node, is_rotating=node.rotating)
+            node_for_probe = None if node.rotating else node.id
+            self._condition.notify_all()
         self._save_state_file()
         if node_for_probe and schedule_probe: self._schedule_failure_probe(node_for_probe)
 
