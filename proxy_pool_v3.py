@@ -20,7 +20,7 @@ from curl_cffi import requests
 from proxy_protocol_runtime import ProtocolRuntimeManager
 from proxy_protocols import ProxyDescriptor, ProxyProtocolError, parse_proxy_line, parse_subscription_source
 from error_taxonomy import classify_proxy_network_error, is_transport_error_text
-from proxy_pool_registry import reconcile_nodes
+from proxy_pool_registry import SourceRegistry, reconcile_nodes
 from proxy_pool_policies import (
     DefaultSelectorPolicy,
     DefaultFailurePolicy,
@@ -117,16 +117,6 @@ class ProxyLease:
     released: bool = False
     feedback_sampled: bool = False
     suspected_feedback: bool = False
-
-
-@dataclass
-class SourceState:
-    descriptors: List[ProxyDescriptor] = field(default_factory=list)
-    last_success_at: Optional[float] = None
-    last_error: str = ""
-    generation: int = 0
-    diagnostics: Dict = field(default_factory=dict)
-    configured: bool = False
 
 
 def _config_signature(config):
@@ -242,7 +232,7 @@ class ProxyPoolManager:
         self._last_refresh = 0.0
         self._last_probe_all = 0.0
         self._probe_all_running = False
-        self._source_states = {"file": SourceState(), "subscription": SourceState()}
+        self._source_registry = SourceRegistry(self.config, self.log)
         self._source_diagnostics = {}
         self._persisted_state = self._load_state_file()
         self._runtime = ProtocolRuntimeManager(self.config, log=self.log)
@@ -385,36 +375,6 @@ class ProxyPoolManager:
             raise ProxyPoolError("代理订阅内容超过 2 MiB 限制")
         return parse_subscription_source(body)
 
-    def _refresh_source(self, name, loader):
-        state = self._source_states[name]
-        configured = bool(self.config.get("proxy_pool_file") if name == "file" else self.config.get("proxy_pool_subscription_url"))
-        state.configured = configured
-        if not configured:
-            state.descriptors = []
-            state.last_error = ""
-            state.diagnostics = {}
-            return
-        try:
-            result = loader()
-            if result is None:
-                state.descriptors = []
-                return
-            state.descriptors = list(result.nodes)
-            state.last_success_at = time.time()
-            state.last_error = ""
-            state.generation += 1
-            state.diagnostics = result.as_dict()
-            state.diagnostics.update({"stale": False, "generation": state.generation, "last_success_at": state.last_success_at})
-            if result.skipped:
-                self.log("[!] %s 跳过 %s 个无法解析的节点" % (name, result.skipped))
-        except Exception as exc:
-            state.last_error = safe_proxy_error_text(exc)
-            if state.descriptors:
-                state.diagnostics = dict(state.diagnostics)
-                state.diagnostics.update({"stale": True, "error": state.last_error, "generation": state.generation})
-                self.log("[!] %s 刷新失败，继续使用最近一次成功节点: %s" % (name, state.last_error))
-            else:
-                state.diagnostics = {"stale": True, "error": state.last_error, "generation": state.generation}
 
     def _source_entries(self):
         if self.mode == "single":
@@ -424,21 +384,13 @@ class ProxyPoolManager:
                 raise ProxyPoolError(str(exc)) from exc
         if self.mode != "pool":
             return []
-        self._refresh_source("file", self._read_file_source)
-        self._refresh_source("subscription", self._fetch_subscription)
-        values = []
-        for name in ("file", "subscription"):
-            values.extend((name, item) for item in self._source_states[name].descriptors)
-        unique, seen = [], set()
-        for source, descriptor in values:
-            if descriptor.node_id not in seen:
-                seen.add(descriptor.node_id); unique.append((source, descriptor))
-        self._source_diagnostics = {name: dict(state.diagnostics) for name, state in self._source_states.items() if state.configured}
-        if not unique:
-            errors = [state.last_error for state in self._source_states.values() if state.last_error]
-            detail = "; ".join(errors) if errors else "未配置代理池文件或订阅"
-            raise ProxyPoolError("代理池没有可用节点: %s" % detail)
-        return unique
+        loaders = {
+            "file": self._read_file_source,
+            "subscription": self._fetch_subscription,
+        }
+        entries = self._source_registry.collect(loaders)
+        self._source_diagnostics = self._source_registry.diagnostics
+        return entries
 
     def _reload_sources_locked(self, force=False):
         """Refresh sources while the dedicated refresh lock is held."""
