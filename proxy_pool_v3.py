@@ -28,12 +28,14 @@ from proxy_pool_policies import (
     FailurePolicy,
 )
 from proxy_pool_probe import ProbeScheduler
+from pool_api import ProxyPool
 
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 _MAX_SOURCE_BYTES = 2 << 20
 _TLS = threading.local()
 _MANAGER_LOCK = threading.RLock()
 _MANAGER = None
+_POOL = None
 
 
 class ProxyPoolError(RuntimeError):
@@ -827,7 +829,7 @@ class ProxyPoolManager:
 
 
 def get_manager(config=None, log=None):
-    global _MANAGER
+    global _MANAGER, _POOL
     if config is None:
         from app_config import config as app_config
         config = app_config
@@ -835,63 +837,63 @@ def get_manager(config=None, log=None):
     with _MANAGER_LOCK:
         if _MANAGER is None:
             _MANAGER = ProxyPoolManager(config, log=log)
+            _POOL = ProxyPool(_MANAGER)
         elif _MANAGER.signature != signature and _MANAGER.total_inflight() == 0:
-            old = _MANAGER; _MANAGER = ProxyPoolManager(config, log=log); old.shutdown()
+            old = _MANAGER; _MANAGER = ProxyPoolManager(config, log=log); _POOL = ProxyPool(_MANAGER); old.shutdown()
         elif log is not None:
             _MANAGER.log = log; _MANAGER._runtime.log = log
         return _MANAGER
 
 
+def get_pool(config=None, log=None) -> ProxyPool:
+    """Return the process-wide pool facade, creating the manager on first use."""
+    get_manager(config=config, log=log)
+    return _POOL
+
+
 def reset_manager():
-    global _MANAGER
+    global _MANAGER, _POOL
     with _MANAGER_LOCK:
         if _MANAGER is not None and _MANAGER.total_inflight() > 0:
             raise ProxyPoolError("仍有代理租约使用中，不能重置代理池")
-        old = _MANAGER; _MANAGER = None
+        old = _MANAGER; _MANAGER = None; _POOL = None
     if old is not None: old.shutdown()
 
 
-def current_proxy_lease(): return getattr(_TLS, "lease", None)
+def current_proxy_lease():
+    lease = getattr(_TLS, "lease", None)
+    if lease is not None:
+        return get_pool().lease
+    return None
 def current_proxy_url():
     lease = current_proxy_lease(); return None if lease is None else str(lease.proxy_url or "")
 def managed_proxy_active(): return current_proxy_lease() is not None
 
 
 def begin_registration_slot(slot_index, attempt_index=1, worker_key=None, log=None, cancel_callback=None):
-    if current_proxy_lease() is not None: raise ProxyPoolError("当前线程已有未释放的代理租约")
-    manager = get_manager(log=log)
-    if not manager.managed: return None
-    worker = str(worker_key or threading.current_thread().name or "worker"); slot = int(slot_index); attempt = int(attempt_index)
-    affinity = "%s:slot:%s" % (worker, slot)
-    session_seed = "%s:%s:%s:%s" % (worker, slot, attempt, secrets.token_hex(8))
-    session_key = hashlib.sha256(session_seed.encode("utf-8")).hexdigest()[:16]
-    lease = manager.acquire(affinity=affinity, worker_key=worker, slot_index=slot, attempt_index=attempt, session_key=session_key, cancel_callback=cancel_callback)
-    _TLS.lease = lease
-    if log is not None:
-        label = lease.source_uri or lease.proxy_url; log("[*] 当前账号代理: %s" % proxy_log_label(label))
-        if lease.source_uri and lease.proxy_url and lease.source_uri != lease.proxy_url: log("[*] 当前代理本地出口: %s" % lease.proxy_url)
+    pool = get_pool(config=None, log=log)
+    lease = pool.acquire(slot_index, attempt_index=attempt_index, worker_key=worker_key, cancel_callback=cancel_callback)
+    if lease is not None and log is not None:
+        label = lease.source_uri or lease.proxy_url
+        log("[*] 当前账号代理: %s" % proxy_log_label(label))
+        if lease.source_uri and lease.proxy_url and lease.source_uri != lease.proxy_url:
+            log("[*] 当前代理本地出口: %s" % lease.proxy_url)
     return lease
 
 
 def end_registration_slot(success=False, transport_error=None):
-    lease = current_proxy_lease()
-    if lease is None: return
-    manager = get_manager()
-    try:
-        if transport_error is not None: manager.report_transport_failure(lease, transport_error)
-        elif success: manager.report_success(lease)
-    finally:
-        manager.release(lease); _TLS.lease = None
+    pool = get_pool()
+    pool.release(success=success, transport_error=transport_error)
 
 
 def report_current_transport_failure(error):
-    lease = current_proxy_lease()
-    if lease is not None: get_manager().report_transport_failure(lease, error)
+    pool = get_pool()
+    pool.report_transport_failure(error)
 
 
 def report_current_suspected_transport_failure(error):
-    lease = current_proxy_lease()
-    if lease is not None: get_manager().report_suspected_transport_failure(lease, error)
+    pool = get_pool()
+    pool.report_suspected_transport_failure(error)
 
 
 def manager_snapshot(config=None):
