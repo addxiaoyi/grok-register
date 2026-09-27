@@ -104,6 +104,9 @@ class ProxyPool:
     def status(self) -> dict:
         return self._manager.snapshot()
 
+    # Alias kept so callers can read either name against the same surface.
+    snapshot = status
+
     def reload(self, force: bool = False) -> dict:
         return self._manager.reload_sources(force=force)
 
